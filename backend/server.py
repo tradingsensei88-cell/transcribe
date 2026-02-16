@@ -1,72 +1,175 @@
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, HTTPException
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict
-from typing import List
-import uuid
+from pydantic import BaseModel, Field, ConfigDict, HttpUrl, field_validator
+from typing import List, Optional
 from datetime import datetime, timezone
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
+import re
+from urllib.parse import urlparse, parse_qs
 
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
-# Create the main app without a prefix
-app = FastAPI()
-
-# Create a router with the /api prefix
+app = FastAPI(title="YouTube Transcript API")
 api_router = APIRouter(prefix="/api")
 
 
-# Define Models
-class StatusCheck(BaseModel):
-    model_config = ConfigDict(extra="ignore")  # Ignore MongoDB's _id field
+class TranscriptSegment(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    text: str = Field(..., description="Transcript text for this segment")
+    start: float = Field(..., description="Start time in seconds")
+    duration: float = Field(..., description="Duration of segment in seconds")
+
+
+class TranscriptResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    video_id: str = Field(..., description="YouTube video ID")
+    language: str = Field(..., description="Transcript language")
+    language_code: str = Field(..., description="Language code")
+    is_generated: bool = Field(..., description="Whether transcript was auto-generated")
+    transcript: List[TranscriptSegment] = Field(..., description="Transcript segments")
+
+
+class TranscriptRequest(BaseModel):
+    video_url: str = Field(..., description="YouTube video URL or ID")
+    languages: List[str] = Field(default=["en"], description="Preferred transcript languages")
+
+
+def extract_video_id(url_or_id: str) -> Optional[str]:
+    """Extract YouTube video ID from URL or validate if already an ID"""
+    if not url_or_id or not isinstance(url_or_id, str):
+        return None
     
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    video_id_pattern = r'^[a-zA-Z0-9_-]{11}$'
+    if re.match(video_id_pattern, url_or_id):
+        return url_or_id
+    
+    try:
+        if not url_or_id.startswith(('http://', 'https://')):
+            url_or_id = 'https://' + url_or_id
+        
+        parsed_url = urlparse(url_or_id)
+        
+        if 'youtube.com' in parsed_url.netloc:
+            if parsed_url.path == '/watch':
+                query_params = parse_qs(parsed_url.query)
+                video_ids = query_params.get('v', [])
+                if video_ids:
+                    return video_ids[0]
+            elif parsed_url.path.startswith('/embed/'):
+                return parsed_url.path.split('/embed/')[1]
+            elif parsed_url.path.startswith('/v/'):
+                return parsed_url.path.split('/v/')[1].split('?')[0]
+        elif 'youtu.be' in parsed_url.netloc:
+            video_id = parsed_url.path.lstrip('/')
+            return video_id.split('?')[0]
+        
+        regex_pattern = r'(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})'
+        match = re.search(regex_pattern, url_or_id)
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+    
+    return None
 
-class StatusCheckCreate(BaseModel):
-    client_name: str
 
-# Add your routes to the router instead of directly to app
 @api_router.get("/")
 async def root():
-    return {"message": "Hello World"}
+    return {"message": "YouTube Transcript API Server"}
 
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.model_dump()
-    status_obj = StatusCheck(**status_dict)
-    
-    # Convert to dict and serialize datetime to ISO string for MongoDB
-    doc = status_obj.model_dump()
-    doc['timestamp'] = doc['timestamp'].isoformat()
-    
-    _ = await db.status_checks.insert_one(doc)
-    return status_obj
 
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    # Exclude MongoDB's _id field from the query results
-    status_checks = await db.status_checks.find({}, {"_id": 0}).to_list(1000)
-    
-    # Convert ISO string timestamps back to datetime objects
-    for check in status_checks:
-        if isinstance(check['timestamp'], str):
-            check['timestamp'] = datetime.fromisoformat(check['timestamp'])
-    
-    return status_checks
+@api_router.post("/transcript", response_model=TranscriptResponse)
+async def extract_transcript(request: TranscriptRequest):
+    """Extract transcript from YouTube video"""
+    try:
+        video_id = extract_video_id(request.video_url)
+        
+        if not video_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid YouTube URL or video ID. Please provide a valid YouTube link."
+            )
+        
+        try:
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            transcript = None
+            
+            for language_code in request.languages:
+                try:
+                    transcript = transcript_list.find_transcript([language_code])
+                    break
+                except NoTranscriptFound:
+                    continue
+            
+            if not transcript:
+                available_transcripts = list(transcript_list)
+                if available_transcripts:
+                    transcript = available_transcripts[0]
+                else:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="No transcripts found for this video. The video may not have captions enabled."
+                    )
+            
+            transcript_data = transcript.fetch()
+            
+            segments = [
+                TranscriptSegment(
+                    text=item["text"],
+                    start=item["start"],
+                    duration=item["duration"]
+                )
+                for item in transcript_data
+            ]
+            
+            response = TranscriptResponse(
+                video_id=video_id,
+                language=transcript.language,
+                language_code=transcript.language_code,
+                is_generated=transcript.is_generated,
+                transcript=segments
+            )
+            
+            return response
+            
+        except TranscriptsDisabled:
+            raise HTTPException(
+                status_code=400,
+                detail="Transcripts are disabled for this video."
+            )
+        except VideoUnavailable:
+            raise HTTPException(
+                status_code=404,
+                detail="Video not found or is unavailable."
+            )
+        except NoTranscriptFound:
+            raise HTTPException(
+                status_code=404,
+                detail="No transcripts available for this video in the requested languages."
+            )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Transcript extraction failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to extract transcript. Please try again later."
+        )
 
-# Include the router in the main app
+
 app.include_router(api_router)
 
 app.add_middleware(
@@ -77,7 +180,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
