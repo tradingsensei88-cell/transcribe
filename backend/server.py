@@ -103,7 +103,8 @@ async def extract_transcript(request: TranscriptRequest):
             )
         
         try:
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            ytt_api = YouTubeTranscriptApi()
+            transcript_list = ytt_api.list(video_id)
             transcript = None
             
             for language_code in request.languages:
