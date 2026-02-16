@@ -128,9 +128,9 @@ async def extract_transcript(request: TranscriptRequest):
             
             segments = [
                 TranscriptSegment(
-                    text=item["text"],
-                    start=item["start"],
-                    duration=item["duration"]
+                    text=item.text if hasattr(item, 'text') else item["text"],
+                    start=item.start if hasattr(item, 'start') else item["start"],
+                    duration=item.duration if hasattr(item, 'duration') else item["duration"]
                 )
                 for item in transcript_data
             ]
