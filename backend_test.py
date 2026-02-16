@@ -119,6 +119,9 @@ class YouTubeTranscriptAPITester:
                         print(f"✅ Transcript contains {len(response['transcript'])} segments")
                 else:
                     print("⚠️  Warning: Transcript is empty")
+        elif not success:
+            # Debug the actual response
+            print(f"   Debug - actual response received: {response}")
         
         return success
 
